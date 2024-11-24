@@ -22,17 +22,17 @@ def get_image_date_taken(file_path):
         else:
             raise ValueError(f"{file_path} has no exif data.")
     except Exception as err:
-        print("WARN:", err)
         timestamp = os.path.getmtime(file_path)
         result = datetime.fromtimestamp(timestamp)
+    print(".", end="")
     return result
 
 
 def organize_images_by_date(source, destination, use_copy):
     """Organizes images into folders by year/month/day."""
-    os.makedirs(destination)
     print("scanning", source)
 
+    file_counter = 0
     for root, _, files in os.walk(source):
         for file in files:
             src_filepath = os.path.join(root, file)
@@ -40,18 +40,17 @@ def organize_images_by_date(source, destination, use_copy):
             try:
                 date_taken = get_image_date_taken(src_filepath)
 
-                # Create a folder structure based on year/month/day
                 year = date_taken.strftime("%Y")
                 month = date_taken.strftime("%m - %B")
                 day_meta = "{day} - {name}".format(
                     day=date_taken.strftime("%d"), name=os.path.basename(root)
                 )
-
                 dst_folder = os.path.join(destination, year, month, day_meta)
                 if not os.path.exists(dst_folder):
                     os.makedirs(dst_folder)
 
                 dst_filepath = os.path.join(dst_folder, file)
+                file_counter += 1
                 if use_copy:
                     shutil.copy(src_filepath, dst_filepath)
                 else:
@@ -59,6 +58,8 @@ def organize_images_by_date(source, destination, use_copy):
 
             except Exception as err:
                 print(f"Cannot process {src_filepath}, reason: {err}")
+
+    return file_counter
 
 
 if __name__ == "__main__":
@@ -70,9 +71,11 @@ if __name__ == "__main__":
 
     print(args.source, "to", args.destination)
     if not os.path.isdir(args.source):
-        parser.error(f"{args.source} is not a folder.")
-    elif os.path.exists(args.destination):
-        parser.error(f"{args.destination} folder already exists.")
+        parser.error(f"{args.source} folder does not exist.")
+    elif not os.path.isdir(args.destination):
+        parser.error(f"{args.destination} folder does not exists.")
 
     source = os.path.realpath(args.source)
-    organize_images_by_date(source, args.destination, args.copy)
+    file_count = organize_images_by_date(source, args.destination, args.copy)
+    print()
+    print(f"Organized {file_count} files.")
