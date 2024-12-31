@@ -66,7 +66,7 @@ def organize_images_by_date(source: Path, destination: Path, use_copy: bool):
                 # move/copy target file
                 dst_filepath = dst_folder / src_filepath.name
 
-                if dst_filepath.exists:
+                if dst_filepath.exists():
                     print(dst_filepath, "already exists.")
                     continue
 
