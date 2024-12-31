@@ -46,8 +46,14 @@ def organize_images_by_date(source: Path, destination: Path, use_copy: bool):
                 date_taken = get_image_date_taken(src_filepath)
                 year = date_taken.strftime("%Y")
                 month = date_taken.strftime("%m - %B")
+
+                previous_name = src_filepath.parent.name.strip()
+                day_prefix = f"{date_taken.day:02} - "
+                if previous_name.startswith(day_prefix):
+                    previous_name = previous_name[len(day_prefix):]
+
                 day_meta = "{day:02} - {name}".format(
-                    day=date_taken.day, name=src_filepath.parent.name.strip()
+                    day=date_taken.day, name=previous_name
                 )
 
                 media_type = (full_mime_type or "/").split("/")[0]
@@ -67,7 +73,7 @@ def organize_images_by_date(source: Path, destination: Path, use_copy: bool):
                 dst_filepath = dst_folder / src_filepath.name
 
                 if dst_filepath.exists():
-                    print(dst_filepath, "already exists.")
+                    print("skip", dst_filepath, "already exists.")
                     continue
 
                 file_counter += 1
