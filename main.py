@@ -2,6 +2,7 @@
 import shutil
 from argparse import ArgumentParser
 from datetime import datetime
+from mimetypes import guess_type
 from pathlib import Path
 
 from PIL import Image
@@ -32,10 +33,16 @@ def get_image_date_taken(filepath: Path):
 def organize_images_by_date(source: Path, destination: Path, use_copy: bool):
     """Organizes images into folders by year/month/day."""
     file_counter = 0
+    media_types_trans = dict(
+        image="poze",
+        video="video",
+        audio="muzica",
+    )
     seen = set()
     for src_filepath in source.rglob("*"):
         if src_filepath.is_file():
             try:
+                full_mime_type, _ = guess_type(src_filepath)
                 date_taken = get_image_date_taken(src_filepath)
                 year = date_taken.strftime("%Y")
                 month = date_taken.strftime("%m - %B")
@@ -43,14 +50,26 @@ def organize_images_by_date(source: Path, destination: Path, use_copy: bool):
                     day=date_taken.day, name=src_filepath.parent.name.strip()
                 )
 
+                media_type = (full_mime_type or "/").split("/")[0]
+                category = media_types_trans.get(media_type, "altele")
+
                 # prepare target folder
-                dst_folder = destination / year / month / day_meta
+                if category == "muzica":
+                    dst_folder = destination / category
+                else:
+                    dst_folder = destination / category / year / month / day_meta
+
                 if dst_folder not in seen:
                     dst_folder.mkdir(parents=True, exist_ok=True)
                     seen.add(dst_folder)
 
                 # move/copy target file
                 dst_filepath = dst_folder / src_filepath.name
+
+                if dst_filepath.exists:
+                    print(dst_filepath, "already exists.")
+                    continue
+
                 file_counter += 1
                 if use_copy:
                     shutil.copy(src_filepath, dst_filepath)
