@@ -1,32 +1,25 @@
 #!/usr/bin/env python
 from argparse import ArgumentParser
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from itertools import groupby
+from logging import basicConfig, getLogger
 from mimetypes import guess_type
+from operator import attrgetter
 from pathlib import Path
 from pprint import pprint
 from types import SimpleNamespace
+from typing import Any
 
 import exifread
-from geopy.extra.rate_limiter import RateLimiter
-from geopy.geocoders import Nominatim
+
+from geocoders import CachedGeolocator
+
+logger = getLogger("Organizer")
 
 TWO_DAYS = 2 * 24 * 3600
 ONE_WEEK = 7 * 24 * 3600
 
-geolocator = RateLimiter(
-    Nominatim(user_agent="photo-location").reverse, min_delay_seconds=1 / 10
-)
-
-
-@lru_cache(maxsize=10_000)
-def _reverse_cached(lat_rounded: float, lon_rounded: float) -> dict:
-    return geolocator((lat_rounded, lon_rounded), language="en")
-
-
-def approximate_reverse(latitude: float, longitude: float, precision: int = 2):
-    lat, lon = round(latitude, precision), round(longitude, precision)
-    return _reverse_cached(lat, lon)
+geolocator = CachedGeolocator()
 
 
 def from_rational(value):
@@ -55,82 +48,152 @@ def dms_to_decimal(dms, ref):
     return decimal
 
 
-def cherrypick_image_properties(exif_data: dict) -> dict:
-    data = dict()
+def parse_exif_info(data: dict) -> dict:
+    props = dict()
 
-    if not exif_data:
-        return data
+    if not data:
+        return props
 
-    if original_time := str(exif_data.get("EXIF DateTimeOriginal")):
-        timestamp = datetime.strptime(original_time, "%Y:%m:%d %H:%M:%S")
-        data["created_at"] = timestamp.replace(tzinfo=timezone.utc)
+    if original_time := data.get("EXIF DateTimeOriginal"):
+        timestamp = datetime.strptime(str(original_time), "%Y:%m:%d %H:%M:%S")
+        props["created_at"] = timestamp.replace(tzinfo=timezone.utc)
 
-    if "GPS GPSLatitude" in exif_data:
-        lat_tag = exif_data.get("GPS GPSLatitude")
-        lat_ref = exif_data.get("GPS GPSLatitudeRef")
-        lon_tag = exif_data.get("GPS GPSLongitude")
-        lon_ref = exif_data.get("GPS GPSLongitudeRef")
+    if "GPS GPSLatitude" in data:
+        lat_tag = data.get("GPS GPSLatitude")
+        lat_ref = data.get("GPS GPSLatitudeRef")
+        lon_tag = data.get("GPS GPSLongitude")
+        lon_ref = data.get("GPS GPSLongitudeRef")
 
         latitude = dms_to_decimal(lat_tag.values, lat_ref)
         longitude = dms_to_decimal(lon_tag.values, lon_ref)
-        data["precise_location"] = (latitude, longitude)
+        props["precise_location"] = (latitude, longitude)
 
-        location = approximate_reverse(latitude, longitude)
-        data["approximate_location"] = location.raw.copy()
+    return props
 
-    return data
+
+def parse_image(filepath: Path):
+    with open(filepath, "rb") as image_file:
+        exif_data = exifread.process_file(image_file, details=False, strict=False)
+        props = parse_exif_info(exif_data)
+        return props
+
+
+def stat_created_at(filepath: Path) -> datetime:
+    stat = filepath.stat()
+    earliest = min(stat.st_ctime, stat.st_mtime, stat.st_atime)
+    return datetime.fromtimestamp(earliest).replace(tzinfo=timezone.utc)
 
 
 def scan_all_media_files(source: Path, destination: Path, use_copy: bool):
     """Organizes images into folders by year/month/day."""
     db = list()
+    logger.info(f" scanning {source}")
 
     counter = 0
-    for src_filepath in source.rglob("*"):
+    for filepath in source.rglob("*"):
         counter += 1
-        if counter > 1440:
-            break
 
-        if src_filepath.is_file():
-            try:
-                mime_type, _ = guess_type(src_filepath)
-                print("---", src_filepath.name, "/", mime_type, "---")
+        if filepath.is_dir() or filepath.match(".*") or filepath.match("__*"):
+            continue
 
-                if not mime_type:
-                    continue
+        if filepath.is_file():
+            mime_type, _ = guess_type(filepath)
 
-                properties = dict()
-                stat = src_filepath.stat()
+            if not mime_type:
+                continue
 
-                if mime_type.startswith("image"):
-                    with open(src_filepath, "rb") as image_file:
-                        exif_data = exifread.process_file(image_file, details=False)
-                        image_props = cherrypick_image_properties(exif_data)
-                        properties.update(image_props)
+            logger.debug(f" reading {filepath.name} [{mime_type}]")
 
-                if "created_at" not in properties:
-                    timestamps = [stat.st_ctime, stat.st_mtime, stat.st_atime]
-                    properties["created_at"] = datetime.fromtimestamp(
-                        min(timestamps)
-                    ).replace(tzinfo=timezone.utc)
-                    if isinstance(properties["created_at"], float):
-                        print(">>", timestamps, "<<")
+            properties: dict[str, Any] = dict(
+                original_path=str(filepath.relative_to(source)),
+                original_filename=filepath.stem,
+                original_extension=filepath.suffix,
+            )
 
-                if "approximate_location" not in properties:
-                    properties["approximate_location"] = {}
+            if mime_type.startswith("image"):
+                image_props = parse_image(filepath)
+                properties.update(image_props)
 
-                properties["original_filename"] = src_filepath.stem
-                properties["original_extension"] = src_filepath.suffix
+            if "created_at" not in properties:
+                properties["created_at"] = stat_created_at(filepath)
 
-                db.append(SimpleNamespace(**properties))
+            if "precise_location" in properties:
+                location = geolocator.reverse(*properties["precise_location"])
+            else:
+                location = {}
 
-            except Exception as err:
-                print(f"Cannot process {src_filepath}, reason: {err}")
+            properties["approximate_location"] = location
+            address = location.get("address", {"ISO3166-2-lvl4": "RO"})
+
+            # NOTE: pre-compute relevant keys
+            properties["location_key"] = "{}__{}".format(
+                address.get("ISO3166-2-lvl4"), address.get("postcode")
+            )
+
+            db.append(SimpleNamespace(**properties))
+
+    db.sort(key=lambda props: props.created_at)
 
     return db
 
 
+def trace_events_timeline(files_db: list):
+    if not files_db:
+        return
+
+    first, *remaining = files_db
+    this_address = first.approximate_location.get("address", {})
+    last_event = SimpleNamespace(
+        created=first.created_at.date(),
+        location_key=first.location_key,
+        name=", ".join(
+            (
+                this_address.get("village")
+                or this_address.get("town")
+                or this_address.get("city")
+                or this_address.get("municipality")
+                or first.original_filename,
+                this_address.get("county", ""),
+                first.created_at.strftime("%b %d, %Y"),
+            )
+        ).strip(),
+        key="{}__{}".format(first.created_at.date().isoformat(), first.location_key),
+    )
+    first.event = last_event
+
+    for meta in remaining:
+        delta = meta.created_at.date() - last_event.created
+        same_location = (
+            meta.approximate_location and meta.location_key == last_event.location_key
+        )
+
+        if delta.days >= 7 or not same_location:
+            this_address = meta.approximate_location.get("address", {})
+            last_event = SimpleNamespace(
+                created=meta.created_at.date(),
+                location_key=meta.location_key,
+                name=", ".join(
+                    (
+                        this_address.get("village")
+                        or this_address.get("town")
+                        or this_address.get("city")
+                        or this_address.get("municipality")
+                        or meta.original_filename,
+                        this_address.get("county", "RO"),
+                        meta.created_at.strftime("%b %d, %Y"),
+                    )
+                ).strip(),
+                key="{}__{}".format(
+                    meta.created_at.date().isoformat(), meta.location_key
+                ),
+            )
+
+        meta.event = last_event
+
+
 if __name__ == "__main__":
+    basicConfig(level="INFO")
+
     parser = ArgumentParser()
     parser.add_argument("--copy", action="store_true", default=False)
     parser.add_argument("source")
@@ -139,7 +202,6 @@ if __name__ == "__main__":
 
     source = Path(args.source).resolve()
     destination = Path(args.destination).resolve()
-    print("Reorganizing", source, "to", destination)
 
     if not source.is_dir():
         parser.error(f"{source} folder does not exist.")
@@ -148,71 +210,15 @@ if __name__ == "__main__":
     elif source == destination:
         parser.error(f"Source and destination cannot be the same ({source})")
 
-    files = scan_all_media_files(source, destination, args.copy)
-    print()
+    files_meta = scan_all_media_files(source, destination, args.copy)
+    trace_events_timeline(files_meta)
 
-    for meta in files:
-        print(meta.created_at)
+    events = dict()
 
-    files.sort(key=lambda fi: fi.created_at)
+    for key, metas in groupby(files_meta, key=attrgetter("event.key")):
+        events[key] = list(metas)
 
-    last_date = files[0].created_at.date()
-    address = files[0].approximate_location.get(
-        "address",
-        dict(municipality="no_gps", county="", postcode="no_gps"),
-    )
-    last_location = address["postcode"]
+    for key, metas in events.items():
+        print(key, repr(metas[0].event.name), "has", len(metas), "files")
 
-    event_key = f"{last_date.isoformat()}__{last_location}"
-    event_name = "{date}__{name}".format(
-        date=last_date.isoformat(),
-        name="__".join(
-            (
-                address.get("village")
-                or address.get("city")
-                or address.get("town")
-                or address.get("municipality"),
-                address["county"],
-            ),
-        ).strip("_"),
-    )
-    event_name = event_name.lower().replace(" ", "-")
-    print("new event", event_key, event_name)
-
-    for props in files[1:]:
-        current_date = props.created_at.date()
-        address = props.approximate_location.get(
-            "address",
-            dict(municipality="no_gps", county="", postcode="no_gps"),
-        )
-        print("using address", address)
-        current_location = address.get("postcode", "no_gps")
-
-        delta = current_date - last_date
-        if delta.days <= 2:
-            # print("contd.", event_key)
-            pass
-        elif delta.days <= 7 and current_location == last_location:
-            # print("contd. by location", event_key)
-            pass
-        else:
-            event_key = f"{last_date.isoformat()}__{current_location}"
-            event_name = "{date}__{name}".format(
-                date=last_date.isoformat(),
-                name="__".join(
-                    (
-                        address.get("village")
-                        or address.get("city")
-                        or address.get("town")
-                        or address.get("municipality"),
-                        address["county"],
-                    ),
-                ).strip("_"),
-            )
-            event_name = event_name.lower().replace(" ", "-")
-            print("new event", event_key, event_name)
-
-        last_date = props.created_at.date()
-        last_location = address.get("postcode", "no_gps")
-
-    print(f"Found {len(files)} files.")
+    print(".. done ..")
